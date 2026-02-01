@@ -44,12 +44,13 @@ jobs:
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: 加載並更新 Feeds
+        - name: 加載並更新 Feeds
       run: |
-        [ -e $DIY_P1_SH ] && chmod +x $DIY_P1_SH && ./$DIY_P1_SH
+        [ -e $DIY_P1_SH ] && sed -i 's/\r$//' $DIY_P1_SH && chmod +x $DIY_P1_SH && ./$DIY_P1_SH
         cd openwrt
         ./scripts/feeds update -a
         ./scripts/feeds install -a
+
 
     - name: 加載自定義配置 (.config)
       run: |
