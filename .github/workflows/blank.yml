@@ -1,0 +1,104 @@
+name: Build ImmortalWrt for OPi5 Plus
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '是否開啟 SSH 遠端配置 (tmate)'
+        required: false
+        default: 'false'
+
+env:
+  REPO_URL: https://github.com
+  REPO_BRANCH: master
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  TZ: Asia/Hong_Kong
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 檢查專案
+      uses: actions/checkout@v4
+
+    - name: 初始化環境 (針對 RK3588 & Python 補丁)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt update
+        sudo apt -y install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3-distutils python3-pyelftools \
+          python3-setuptools rsync swig unzip zlib1g-dev jq
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: 下載原始碼
+      working-directory: /workdir
+      run: |
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: 加載並更新 Feeds
+      run: |
+        [ -e $DIY_P1_SH ] && chmod +x $DIY_P1_SH && ./$DIY_P1_SH
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 加載自定義配置 (.config)
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        [ -e $DIY_P2_SH ] && chmod +x $DIY_P2_SH && ./$DIY_P2_SH
+        cd openwrt
+        make defconfig
+
+    - name: SSH 遠端配置 (可選)
+      uses: mxschmitt/action-tmate@v3
+      if: github.event.inputs.ssh == 'true'
+      with:
+        limit-access-to-actor: true
+
+    - name: 下載編譯所需的軟體包 (Download)
+      id: package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 開始正式編譯
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        # 雲端 RAM 充足，直接並行編譯
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: 整理成品檔案
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/rockchip/rk3588/
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+
+    - name: 上傳韌體到 Artifacts
+      uses: actions/upload-artifact@v4
+      if: env.FIRMWARE != '' && !cancelled()
+      with:
+        name: ImmortalWrt_OPi5Plus_Firmware
+        path: ${{ env.FIRMWARE }}/*.img.gz
+
+    - name: 發布到 Release
+      uses: softprops/action-gh-release@v2
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      with:
+        tag_name: OPi5Plus_${{ date }}
+        files: ${{ env.FIRMWARE }}/*.img.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
