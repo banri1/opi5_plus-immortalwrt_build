@@ -7,9 +7,10 @@ on:
         description: '是否開啟 SSH 遠端配置 (tmate)'
         required: false
         default: 'false'
+        type: boolean
 
 env:
-  REPO_URL: https://github.com
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: master
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
@@ -24,7 +25,7 @@ jobs:
     - name: 檢查專案
       uses: actions/checkout@v4
 
-    - name: 初始化環境 (針對 RK3588 & Python 補丁)
+    - name: 初始化環境
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -63,7 +64,7 @@ jobs:
       with:
         limit-access-to-actor: true
 
-    - name: 下載編譯所需的軟體包 (Download)
+    - name: 下載編譯所需的軟體包
       id: package
       run: |
         cd openwrt
@@ -76,13 +77,13 @@ jobs:
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        # 雲端 RAM 充足，直接並行編譯
         make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: 整理成品檔案
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
+        echo "RELEASE_TAG=OPi5Plus_$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
         cd openwrt/bin/targets/rockchip/rk3588/
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
@@ -98,7 +99,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       if: steps.compile.outputs.status == 'success' && !cancelled()
       with:
-        tag_name: OPi5Plus_${{ date }}
+        tag_name: ${{ env.RELEASE_TAG }}
         files: ${{ env.FIRMWARE }}/*.img.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
