@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for OPi5 Plus
+name: Build ImmortalWrt for OPi5 Plus (Optimized)
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
     - name: 檢查專案
       uses: actions/checkout@v4
 
-    - name: 初始化環境
+    - name: 初始化環境 (補全工具鏈)
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -44,6 +44,14 @@ jobs:
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
+    - name: 設置編譯快取 (GitHub Cache)
+      uses: actions/cache@v4
+      with:
+        path: openwrt/staging_dir
+        key: ${{ runner.os }}-openwrt-toolchain-${{ hashFiles('openwrt/include/toplevel.mk') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-toolchain-
+
     - name: 加載並更新 Feeds
       run: |
         [ -e $DIY_P1_SH ] && sed -i 's/\r$//' $DIY_P1_SH && chmod +x $DIY_P1_SH && ./$DIY_P1_SH
@@ -54,17 +62,17 @@ jobs:
     - name: 加載自定義配置 (.config)
       run: |
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        [ -e $DIY_P2_SH ] && chmod +x $DIY_P2_SH && ./$DIY_P2_SH
+        [ -e $DIY_P2_SH ] && sed -i 's/\r$//' $DIY_P2_SH && chmod +x $DIY_P2_SH && ./$DIY_P2_SH
         cd openwrt
         make defconfig
 
-    - name: SSH 遠端配置 (可選)
+    - name: SSH 遠端配置 (tmate)
       uses: mxschmitt/action-tmate@v3
       if: github.event.inputs.ssh == 'true'
       with:
         limit-access-to-actor: true
 
-    - name: 下載編譯所需的軟體包
+    - name: 下載軟體包 (Download)
       id: package
       run: |
         cd openwrt
@@ -72,12 +80,22 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    - name: 開始正式編譯
+    - name: 分段編譯 - 1. 基礎工具 (Tools)
+      run: |
+        cd openwrt
+        make tools/install -j$(nproc) || make tools/install V=s
+
+    - name: 分段編譯 - 2. 工具鏈 (Toolchain)
+      run: |
+        cd openwrt
+        make toolchain/install -j$(nproc) || make toolchain/install V=s
+
+    - name: 分段編譯 - 3. 完整固件 (Full Build)
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j$(nproc) V=s
+        make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: 整理成品檔案
