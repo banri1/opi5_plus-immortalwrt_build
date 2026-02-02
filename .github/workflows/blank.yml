@@ -86,11 +86,126 @@ jobs:
     - name: 加載自定義配置 (.config)
       run: |
         # 应用自定义配置文件
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+name: Build ImmortalWrt for OPi5 Plus (Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '是否開啟 SSH 遠端配置 (tmate)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  TZ: Asia/Hong_Kong
+  WORK_DIR: /workdir
+  OPENWRT_DIR: /workdir/openwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180  # 增加至3小时，编译通常需要更长时间
+
+    steps:
+    - name: 檢查專案
+      uses: actions/checkout@v4
+
+    - name: 初始化環境 (補全工具鏈)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 清理系统以减少磁盘使用和潜在冲突
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        
+        # 更新并安装必要依赖
+        sudo apt update
+        sudo apt -y install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3-distutils python3-pyelftools \
+          python3-setuptools rsync swig unzip zlib1g-dev jq ccache \
+          subversion python3-pip python3-venv libelf-dev
+        
+        # 安装额外的Python包（解决警告中的依赖）
+        pip3 install pysocks unidecode
+        
+        # 设置时区
+        sudo timedatectl set-timezone "$TZ"
+        
+        # 创建工作目录并设置权限
+        sudo mkdir -p $WORK_DIR
+        sudo chown $USER:$GROUPS $WORK_DIR
+
+    - name: 設置 ccache 緩存
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: 下載原始碼
+      run: |
+        # 使用浅克隆减少下载时间和磁盘空间
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH $OPENWRT_DIR
+        # 设置ccache
+        echo "BUILD_LOG=1" >> $OPENWRT_DIR/.config
+        echo "CONFIG_CCACHE=y" >> $OPENWRT_DIR/.config
+
+    - name: 設置工具鏈和源碼緩存
+      uses: actions/cache@v4
+      with:
+        # 缓存工具链和下载的源码包，避免重复下载和编译
+        path: |
+          ${{ env.OPENWRT_DIR }}/dl
+          ${{ env.OPENWRT_DIR }}/staging_dir/host
+          ${{ env.OPENWRT_DIR }}/staging_dir/toolchain-*
+        key: ${{ runner.os }}-openwrt-deps-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-deps-
+
+    - name: 加載並更新 Feeds
+      run: |
+        # 执行第一阶段自定义脚本（如果存在）
+        if [ -e $DIY_P1_SH ]; then
+          sed -i 's/\r$//' $DIY_P1_SH
+          chmod +x $DIY_P1_SH
+          ./$DIY_P1_SH
+        fi
+        
+        cd $OPENWRT_DIR
+        
+        # 检查feeds配置文件是否存在
+        if [ ! -f feeds.conf.default ]; then
+          cp feeds.conf.example feeds.conf.default
+        fi
+        
+        # 并行更新和安装feeds
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 加載自定義配置 (.config)
+      run: |
+        # 应用自定义配置文件
+        if [ -e $CONFIG_FILE ]; then
+          cp $CONFIG_FILE $OPENWRT_DIR/.config
+        fi
+        
         # 执行第二阶段自定义脚本
-        [ -e $DIY_P2_SH ] && sed -i 's/\r$//' $DIY_P2_SH && chmod +x $DIY_P2_SH && ./$DIY_P2_SH
-        cd openwrt
-        # 生成完整配置，确保依赖关系正确
+        if [ -e $DIY_P2_SH ]; then
+          sed -i 's/\r$//' $DIY_P2_SH
+          chmod +x $DIY_P2_SH
+          ./$DIY_P2_SH
+        fi
+        
+        cd $OPENWRT_DIR
+        
+        # 启用ccache并生成完整配置
+        echo "CONFIG_CCACHE=y" >> .config
         make defconfig
 
     - name: SSH 遠端配置 (tmate)
@@ -102,68 +217,101 @@ jobs:
     - name: 下載軟體包 (Download)
       id: package
       run: |
-        cd openwrt
-        # 并行下载，使用8个并发连接
-        make download -j8
+        cd $OPENWRT_DIR
+        # 并行下载，使用较少的并发避免网络问题
+        make download -j4
         # 清理无效的小文件（通常下载失败的）
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        find dl -size -1024c -delete 2>/dev/null || true
 
     - name: 編譯 - 階段1：基礎工具
       run: |
-        cd openwrt
+        cd $OPENWRT_DIR
+        # 设置ccache环境变量
+        export CCACHE_DIR=~/.ccache
+        export CCACHE_MAXSIZE=5G
         # 先编译少量核心工具测试环境
-        make tools/install -j$(nproc) || make tools/install -j1 V=s
+        make tools/install -j2 V=s
 
     - name: 編譯 - 階段2：核心工具鏈
       run: |
-        cd openwrt
-        # 编译核心工具链，使用所有CPU核心
-        echo "开始编译工具链，核心数: $(nproc)"
-        make toolchain/install -j$(nproc) || make toolchain/install -j$(($(nproc)/2)) V=s
+        cd $OPENWRT_DIR
+        # 设置ccache环境变量
+        export CCACHE_DIR=~/.ccache
+        export CCACHE_MAXSIZE=5G
+        # 编译核心工具链，使用2个核心（GitHub Actions通常为2核心）
+        echo "开始编译工具链，使用2核心"
+        make toolchain/install -j2 V=s
 
     - name: 編譯 - 階段3：完整固件
       id: compile
       run: |
-        cd openwrt
-        # 完整编译，使用所有核心，失败时降级
-        echo "使用 $(nproc) 线程进行完整编译"
-        make -j$(nproc) || make -j$(($(nproc)/2)) || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
+        cd $OPENWRT_DIR
+        # 设置ccache环境变量
+        export CCACHE_DIR=~/.ccache
+        export CCACHE_MAXSIZE=5G
+        # 完整编译，使用2个核心
+        echo "使用2核心进行完整编译"
+        if make -j2; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          # 如果失败，尝试单线程编译以获取详细错误
+          make -j1 V=s
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
 
     - name: 整理成品檔案
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
         # 生成版本标签
-        echo "RELEASE_TAG=OPi5Plus_$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
-        cd openwrt/bin/targets/rockchip/rk3588/
+        RELEASE_TAG="OPi5Plus_$(date +%Y%m%d_%H%M)"
+        echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_ENV
+        
+        cd $OPENWRT_DIR/bin/targets/rockchip/rk3588/
+        
         # 清理不需要的文件，减少存储占用
         rm -rf packages luci-mod luci-theme-* 2>/dev/null || true
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        
+        # 查找固件文件
+        FIRMWARE_FILES=$(find . -name "*.img.gz" -o -name "*.bin" | head -5)
+        if [ -n "$FIRMWARE_FILES" ]; then
+          echo "FIRMWARE_FOUND=true" >> $GITHUB_ENV
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+        else
+          echo "FIRMWARE_FOUND=false" >> $GITHUB_ENV
+        fi
 
     - name: 更新工具鏈緩存
       if: steps.compile.outputs.status == 'success' && !cancelled()
       uses: actions/cache@v4
       with:
         path: |
-          openwrt/dl
-          openwrt/staging_dir/host
-          openwrt/staging_dir/toolchain-*
-        key: ${{ runner.os }}-openwrt-deps-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/include/kernel-version.mk') }}
+          ${{ env.OPENWRT_DIR }}/dl
+          ${{ env.OPENWRT_DIR }}/staging_dir/host
+          ${{ env.OPENWRT_DIR }}/staging_dir/toolchain-*
+        key: ${{ runner.os }}-openwrt-deps-${{ github.run_id }}-success
 
     - name: 上傳韌體到 Artifacts
       uses: actions/upload-artifact@v4
-      if: env.FIRMWARE != '' && !cancelled()
+      if: env.FIRMWARE_FOUND == 'true' && !cancelled()
       with:
-        name: ImmortalWrt_OPi5Plus_Firmware
-        path: ${{ env.FIRMWARE }}/*.img.gz
+        name: ImmortalWrt_OPi5Plus_Firmware_${{ env.RELEASE_TAG }}
+        path: ${{ env.FIRMWARE_PATH }}/*.img.gz
         retention-days: 7  # 设置保留时间，避免占用过多存储
 
     - name: 發布到 Release
       uses: softprops/action-gh-release@v2
-      if: steps.compile.outputs.status == 'success' && !cancelled()
+      if: env.FIRMWARE_FOUND == 'true' && !cancelled()
       with:
         tag_name: ${{ env.RELEASE_TAG }}
-        files: ${{ env.FIRMWARE }}/*.img.gz
+        files: ${{ env.FIRMWARE_PATH }}/*.img.gz
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 編譯失敗通知
+      if: failure()
+      run: |
+        echo "编译失败，请检查日志"
+        echo "失败时间: $(date)"
