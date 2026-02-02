@@ -20,6 +20,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120  # 理由：设置2小时超时，防止无限运行消耗额度
 
     steps:
     - name: 檢查專案
@@ -29,82 +30,126 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        # 清理系统以减少磁盘使用和潜在冲突
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt update
+        
+        # 只安装必要的编译依赖，避免不必要的包
         sudo apt -y install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
           gettext git libncurses5-dev libssl-dev python3-distutils python3-pyelftools \
           python3-setuptools rsync swig unzip zlib1g-dev jq
+        
+        # 设置时区
         sudo timedatectl set-timezone "$TZ"
+        
+        # 创建工作目录并设置权限
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
+
+    - name: 設置 ccache 緩存
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache  # 缓存编译中间文件，显著加速重复编译
+        key: ${{ runner.os }}-ccache-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
 
     - name: 下載原始碼
       working-directory: /workdir
       run: |
+        # 使用浅克隆减少下载时间和磁盘空间
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        # 创建符号链接以便后续步骤访问
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: 設置編譯快取 (GitHub Cache)
+    - name: 設置工具鏈和源碼緩存
       uses: actions/cache@v4
       with:
-        path: openwrt/staging_dir
-        key: ${{ runner.os }}-openwrt-toolchain-${{ hashFiles('openwrt/include/toplevel.mk') }}
+        # 缓存工具链和下载的源码包，避免重复下载和编译
+        path: |
+          openwrt/dl
+          openwrt/staging_dir/host
+          openwrt/staging_dir/toolchain-*
+        key: ${{ runner.os }}-openwrt-deps-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/include/kernel-version.mk') }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-toolchain-
+          ${{ runner.os }}-openwrt-deps-
 
     - name: 加載並更新 Feeds
       run: |
+        # 执行第一阶段自定义脚本（如果存在）
         [ -e $DIY_P1_SH ] && sed -i 's/\r$//' $DIY_P1_SH && chmod +x $DIY_P1_SH && ./$DIY_P1_SH
         cd openwrt
+        # 并行更新和安装feeds
         ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        ./scripts/feeds install -a -j$(nproc)
 
     - name: 加載自定義配置 (.config)
       run: |
+        # 应用自定义配置文件
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        # 执行第二阶段自定义脚本
         [ -e $DIY_P2_SH ] && sed -i 's/\r$//' $DIY_P2_SH && chmod +x $DIY_P2_SH && ./$DIY_P2_SH
         cd openwrt
+        # 生成完整配置，确保依赖关系正确
         make defconfig
 
     - name: SSH 遠端配置 (tmate)
       uses: mxschmitt/action-tmate@v3
       if: github.event.inputs.ssh == 'true'
       with:
-        limit-access-to-actor: true
+        limit-access-to-actor: true  # 安全限制，只有触发者可以访问
 
     - name: 下載軟體包 (Download)
       id: package
       run: |
         cd openwrt
+        # 并行下载，使用8个并发连接
         make download -j8
+        # 清理无效的小文件（通常下载失败的）
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    - name: 分段編譯 - 1. 基礎工具 (Tools)
+    - name: 編譯 - 階段1：基礎工具
       run: |
         cd openwrt
-        make tools/install -j$(nproc) || make tools/install V=s
+        # 先编译少量核心工具测试环境
+        make tools/install -j$(nproc) || make tools/install -j1 V=s
 
-    - name: 分段編譯 - 2. 工具鏈 (Toolchain)
+    - name: 編譯 - 階段2：核心工具鏈
       run: |
         cd openwrt
-        make toolchain/install -j$(nproc) || make toolchain/install V=s
+        # 编译核心工具链，使用所有CPU核心
+        echo "开始编译工具链，核心数: $(nproc)"
+        make toolchain/install -j$(nproc) || make toolchain/install -j$(($(nproc)/2)) V=s
 
-    - name: 分段編譯 - 3. 完整固件 (Full Build)
+    - name: 編譯 - 階段3：完整固件
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 V=s
+        # 完整编译，使用所有核心，失败时降级
+        echo "使用 $(nproc) 线程进行完整编译"
+        make -j$(nproc) || make -j$(($(nproc)/2)) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: 整理成品檔案
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
+        # 生成版本标签
         echo "RELEASE_TAG=OPi5Plus_$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
         cd openwrt/bin/targets/rockchip/rk3588/
-        rm -rf packages
+        # 清理不需要的文件，减少存储占用
+        rm -rf packages luci-mod luci-theme-* 2>/dev/null || true
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+
+    - name: 更新工具鏈緩存
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      uses: actions/cache@v4
+      with:
+        path: |
+          openwrt/dl
+          openwrt/staging_dir/host
+          openwrt/staging_dir/toolchain-*
+        key: ${{ runner.os }}-openwrt-deps-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/include/kernel-version.mk') }}
 
     - name: 上傳韌體到 Artifacts
       uses: actions/upload-artifact@v4
@@ -112,6 +157,7 @@ jobs:
       with:
         name: ImmortalWrt_OPi5Plus_Firmware
         path: ${{ env.FIRMWARE }}/*.img.gz
+        retention-days: 7  # 设置保留时间，避免占用过多存储
 
     - name: 發布到 Release
       uses: softprops/action-gh-release@v2
